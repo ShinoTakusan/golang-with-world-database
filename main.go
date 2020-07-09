@@ -3,8 +3,9 @@ package main
 import (
 	"fmt"
 	"log"
-	"os"
 	"net/http"
+	"os"
+
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/jmoiron/sqlx"
 	"github.com/labstack/echo/v4"
@@ -32,7 +33,7 @@ func main() {
 	e := echo.New()
 
 	e.GET("/cities/:cityName", getCityInfoHandler)
-
+	e.POST("/insertCityData", insertCityData)
 	e.Start(":12200")
 }
 
@@ -47,4 +48,16 @@ func getCityInfoHandler(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, city)
+}
+
+func insertCityData(c echo.Context) error {
+	data := new(City)
+	err := c.Bind(data)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, data)
+	}
+	db.Exec(`insert into city (Name, CountryCode, District,Population) values (?,?,?,?)`,
+		data.Name, data.CountryCode, data.District, data.Population)
+
+	return c.String(http.StatusOK, "complete")
 }
