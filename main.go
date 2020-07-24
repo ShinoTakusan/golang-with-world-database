@@ -24,6 +24,15 @@ type City struct {
 	Population  int    `json:"population,omitempty"  db:"Population"`
 }
 
+type CityList struct {
+	Name string `json:"name,omitempty"  db:"Name"`
+}
+
+type Country struct {
+	Code string `json:"code,omitempty"  db:"Code"`
+	Name string `json:"name,omitempty"  db:"Name"`
+}
+
 var (
 	db *sqlx.DB
 )
@@ -57,6 +66,9 @@ func main() {
 	withLogin := e.Group("") //何もないグループの宣言(linuxの権限グループ的な)
 	withLogin.Use(checkLogin)
 	withLogin.GET("/cities/:cityName", getCityInfoHandler)
+	withLogin.GET("/whoami", getWhoAmIHandler)
+	withLogin.GET("/country", getCountryInfoHandler)
+	withLogin.GET("/citylist/:countryName",getCityListHandler)
 
 	e.Start(":12200")
 }
@@ -69,6 +81,10 @@ type LoginRequestBody struct {
 type User struct {
 	Username   string `json:"username,omitempty"  db:"Username"`
 	HashedPass string `json:"-"  db:"HashedPass"`
+}
+
+type Me struct {
+	Username string `json:"username,omitempty" db:"username"`
 }
 
 //User登録を行う関数
@@ -182,4 +198,29 @@ func getCityInfoHandler(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, city)
+}
+
+func getWhoAmIHandler(c echo.Context) error {
+	return c.JSON(http.StatusOK, Me{
+		Username: c.Get("userName").(string),
+	})
+}
+
+func getCountryInfoHandler(c echo.Context) error {
+	country := []Country{}
+	db.Select(&country, "SELECT Code, Name FROM country")
+	return c.JSON(http.StatusOK, country)
+}
+
+func getCityListHandler(c echo.Context) error {
+	countryName := c.Param("countryName")
+
+	citylist := []CityList{}
+	db.Select(&citylist,
+		"select city.Name from city join country on CountryCode = Code where country.Name = ?",
+		countryName)
+	if len(citylist) == 0 {
+		return c.NoContent(http.StatusNotFound)
+	}
+	return c.JSON(http.StatusOK, citylist)
 }
