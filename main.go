@@ -6,9 +6,14 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/labstack/echo-contrib/session"
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+	"github.com/srinathgs/mysqlstore"
+	"golang.org/x/crypto/bcrypt"
+
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/jmoiron/sqlx"
-	"github.com/labstack/echo/v4"
 )
 
 type City struct {
@@ -24,22 +29,151 @@ var (
 )
 
 func main() {
+	// データベースにアクセス
 	_db, err := sqlx.Connect("mysql", fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8&parseTime=True&loc=Local", os.Getenv("DB_USERNAME"), os.Getenv("DB_PASSWORD"), os.Getenv("DB_HOSTNAME"), os.Getenv("DB_PORT"), os.Getenv("DB_DATABASE")))
 	if err != nil {
 		log.Fatalf("Cannot Connect to Database: %s", err)
 	}
 	db = _db
 
+	store, err := mysqlstore.NewMySQLStoreFromConnection(db.DB, "sessions", "/", 60*60*24*14, []byte("secret-token"))
+	if err != nil {
+		panic(err)
+	}
+
+	//echoの設定
 	e := echo.New()
 
-	e.GET("/cities/:cityName", getCityInfoHandler)
-	e.POST("/insertCityData", insertCityData)
+	//セッションを覚えておく場所？？
+	e.Use(middleware.Logger())
+	e.Use(session.Middleware(store))
+
+	e.GET("/ping", func(c echo.Context) error {
+		return c.String(http.StatusOK, "pong")
+	})
+	e.POST("/login", postLoginHandler)
+	e.POST("/signup", postSignUpHandler)
+
+	withLogin := e.Group("") //何もないグループの宣言(linuxの権限グループ的な)
+	withLogin.Use(checkLogin)
+	withLogin.GET("/cities/:cityName", getCityInfoHandler)
+
 	e.Start(":12200")
 }
 
+type LoginRequestBody struct {
+	Username string `json:"username,omitempty" form:"username"`
+	Password string `json:"password,omitempty" form:"password"`
+}
+
+type User struct {
+	Username   string `json:"username,omitempty"  db:"Username"`
+	HashedPass string `json:"-"  db:"HashedPass"`
+}
+
+//User登録を行う関数
+func postSignUpHandler(c echo.Context) error {
+	//reqに認証情報をいれる。
+	req := LoginRequestBody{}
+	c.Bind(&req)
+
+	//なんも入ってないとき
+	// もう少し真面目にバリデーションするべき
+	if req.Password == "" || req.Username == "" {
+		// エラーは真面目に返すべき
+		return c.String(http.StatusBadRequest, "項目が空です")
+	}
+
+	//本当に入ってないのかを検査
+	//はいっていたら、ハッシュ化して保存
+	hashedPass, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		return c.String(http.StatusInternalServerError, fmt.Sprintf("bcrypt generate error: %v", err))
+	}
+
+	// ユーザーの存在チェック
+	var count int
+	// ユーザーの人数をとる
+	err = db.Get(&count, "SELECT COUNT(*) FROM users WHERE Username=?", req.Username)
+	// データーベースエラー
+	if err != nil {
+		return c.String(http.StatusInternalServerError, fmt.Sprintf("db error: %v", err))
+	}
+	//すでにUSERがいる場合は、存在しているので駄目ですとする。
+	if count > 0 {
+		return c.String(http.StatusConflict, "ユーザーが既に存在しています")
+	}
+
+	//データベースに情報を追加、駄目な場合はinternal error
+	_, err = db.Exec("INSERT INTO users (Username, HashedPass) VALUES (?, ?)", req.Username, hashedPass)
+	if err != nil {
+		return c.String(http.StatusInternalServerError, fmt.Sprintf("db error: %v", err))
+	}
+	return c.NoContent(http.StatusCreated)
+}
+
+// ログインに関する関数
+func postLoginHandler(c echo.Context) error {
+	//ログイン情報をバインド
+	req := LoginRequestBody{}
+	c.Bind(&req)
+
+	//ユーザーネームを参照し、パスワードとユーザーネームをとってくる
+	user := User{}
+	err := db.Get(&user, "SELECT * FROM users WHERE username=?", req.Username)
+	if err != nil {
+		return c.String(http.StatusInternalServerError, fmt.Sprintf("db error: %v", err))
+	}
+
+	//パスワードをハッシュ化して比較
+	err = bcrypt.CompareHashAndPassword([]byte(user.HashedPass), []byte(req.Password))
+	if err != nil {
+		//ハッシュが一致しない
+		if err == bcrypt.ErrMismatchedHashAndPassword {
+			return c.NoContent(http.StatusForbidden)
+
+		} else {
+			//ハッシュ化ができない
+			return c.NoContent(http.StatusInternalServerError)
+		}
+	}
+
+	//セッションを保存する
+	sess, err := session.Get("sessions", c)
+	if err != nil {
+		fmt.Println(err)
+		return c.String(http.StatusInternalServerError, "something wrong in getting session")
+	}
+	sess.Values["userName"] = req.Username
+	sess.Save(c.Request(), c.Response())
+
+	return c.NoContent(http.StatusOK)
+}
+
+//middleware (ハンドラーを返す関数)
+func checkLogin(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		//セッションの取得
+		sess, err := session.Get("sessions", c)
+		//セッションが取れなかった…
+		if err != nil {
+			fmt.Println(err)
+			return c.String(http.StatusInternalServerError, "something wrong in getting session")
+		}
+		//セッションがないときは、ログインしてない。
+		if sess.Values["userName"] == nil {
+			return c.String(http.StatusForbidden, "please login")
+		}
+		//ログインしていることを確認したので、cにいれる。
+		c.Set("userName", sess.Values["userName"].(string))
+		fmt.Println("login !!", c.Get("userName"))
+		return next(c)
+	}
+}
+
+//Paramで与えられたものを返す関数
 func getCityInfoHandler(c echo.Context) error {
 	cityName := c.Param("cityName")
-	fmt.Println(cityName)
 
 	city := City{}
 	db.Get(&city, "SELECT * FROM city WHERE Name=?", cityName)
@@ -48,16 +182,4 @@ func getCityInfoHandler(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, city)
-}
-
-func insertCityData(c echo.Context) error {
-	data := new(City)
-	err := c.Bind(data)
-	if err != nil {
-		return c.JSON(http.StatusBadRequest, data)
-	}
-	db.Exec(`insert into city (Name, CountryCode, District,Population) values (?,?,?,?)`,
-		data.Name, data.CountryCode, data.District, data.Population)
-
-	return c.String(http.StatusOK, "complete")
 }
